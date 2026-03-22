@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>IMAP Email Cleaner</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0e0f11;
+    --surface:   #161719;
+    --surface2:  #1e2023;
+    --border:    #2a2c30;
+    --border2:   #3a3d43;
+    --text:      #e2e4e8;
+    --muted:     #7a7f8a;
+    --hint:      #4a4f58;
+    --accent:    #4f8ef7;
+    --danger:    #e05252;
+    --danger-bg: #1f1416;
+    --warn:      #e09a30;
+    --warn-bg:   #1c1710;
+    --success:   #4caf7d;
+    --success-bg:#101c14;
+    --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+    --radius:    6px;
+    --radius-lg: 10px;
+  }
+
+  html { background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 13px; }
+  body { min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2rem 1rem 4rem; }
+
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.04em; color: var(--text); margin-bottom: 2px; }
+  .tagline { font-size: 11px; color: var(--muted); margin-bottom: 2rem; letter-spacing: 0.02em; }
+
+  .app { width: 100%; max-width: 780px; display: flex; flex-direction: column; gap: 12px; }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+  }
+  .panel-title { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .panel-body { padding: 16px; }
+
+  .field-row { display: grid; gap: 10px; margin-bottom: 12px; }
+  .field-row.cols-2 { grid-template-columns: 1fr 1fr; }
+  .field-row.cols-3 { grid-template-columns: 2fr 1fr auto; }
+  .field-row.cols-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+
+  label { font-size: 10px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; display: block; margin-bottom: 5px; }
+
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 7px 10px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  select option { background: var(--surface); }
+
+  .tls-row { display: flex; align-items: center; gap: 8px; padding-top: 18px; }
+  .tls-row input[type=checkbox] { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer; }
+  .tls-row span { font-size: 12px; color: var(--muted); cursor: pointer; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 4px; }
+  button {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: var(--radius);
+    border: 1px solid var(--border2);
+    cursor: pointer;
+    padding: 7px 14px;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.1); }
+  .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .btn-danger:hover:not(:disabled) { filter: brightness(1.1); }
+  .btn-ghost { background: transparent; color: var(--muted); }
+  .btn-ghost:hover:not(:disabled) { background: var(--surface2); color: var(--text); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button:active:not(:disabled) { transform: scale(0.98); }
+
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; letter-spacing: 0.04em;
+    padding: 3px 9px; border-radius: 20px;
+  }
+  .pill-ok      { background: var(--success-bg); color: var(--success); border: 1px solid var(--success); }
+  .pill-error   { background: var(--danger-bg);  color: var(--danger);  border: 1px solid var(--danger); }
+  .pill-warn    { background: var(--warn-bg);    color: var(--warn);    border: 1px solid var(--warn); }
+  .pill-info    { background: #0e1620;           color: var(--accent);  border: 1px solid var(--accent); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* filter controls */
+  .seg-group { display: flex; }
+  .seg-group button {
+    flex: 1; border-radius: 0; border-right-width: 0; font-size: 11px;
+    background: var(--bg); color: var(--muted);
+  }
+  .seg-group button:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+  .seg-group button:last-child  { border-radius: 0 var(--radius) var(--radius) 0; border-right-width: 1px; }
+  .seg-group button.active { background: var(--surface2); color: var(--text); border-color: var(--accent); z-index: 1; }
+
+  /* email table */
+  .email-table-wrap { max-height: 340px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--hint); padding: 7px 10px; background: var(--surface2); border-bottom: 1px solid var(--border); font-weight: 600; text-align: left; }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  tr.deleting td { background: var(--danger-bg); }
+  tr.deleted  td { opacity: 0.38; }
+  tr.skipped  td { opacity: 0.38; }
+  .col-status { width: 28px; text-align: center; }
+  .col-read   { width: 26px; text-align: center; }
+  .col-from   { width: 200px; }
+  .col-date   { width: 140px; min-width: 140px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: visible; }
+  td.col-date { overflow: visible; text-overflow: clip; }
+  .col-size   { width: 70px; color: var(--muted); font-size: 11px; text-align: right; }
+  .col-row-status { width: 70px; text-align: right; }
+
+  .read-badge {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  }
+  .unread { background: var(--accent); }
+  .read   { background: var(--hint); }
+
+  .row-tag {
+    font-size: 10px; padding: 2px 6px; border-radius: 10px; font-weight: 600;
+  }
+  .tag-pending  { color: var(--hint); }
+  .tag-deleting { color: var(--warn);    background: var(--warn-bg); }
+  .tag-done     { color: var(--success); background: var(--success-bg); }
+  .tag-skipped  { color: var(--danger);  background: var(--danger-bg); }
+
+  /* progress */
+  .progress-area { margin-top: 14px; }
+  .progress-bar-bg { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .progress-bar-fill { height: 3px; background: var(--accent); border-radius: 2px; width: 0%; transition: width 0.35s ease; }
+  .progress-bar-fill.danger { background: var(--danger); }
+  .progress-stats { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--muted); }
+
+  /* rate limit indicator */
+  .rate-banner {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--warn-bg); border: 1px solid var(--warn);
+    border-radius: var(--radius); padding: 8px 12px; margin-top: 10px;
+    font-size: 11px; color: var(--warn);
+  }
+  .rate-banner.hidden { display: none; }
+  .pulse { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
+
+  .notice {
+    font-size: 11px; color: var(--muted); background: var(--surface2);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px;
+    margin-top: 10px; line-height: 1.7;
+  }
+  .hidden { display: none !important; }
+
+  .scan-progress { display:flex; align-items:center; gap:10px; padding: 8px 0 4px; }
+  .scan-spinner { display:inline-flex; gap:3px; }
+  .scan-spinner span {
+    display:inline-block; width:3px; height:12px; background:var(--accent);
+    border-radius:2px; animation: scanbar 1s ease-in-out infinite;
+  }
+  .scan-spinner span:nth-child(2) { animation-delay:0.15s; }
+  .scan-spinner span:nth-child(3) { animation-delay:0.30s; }
+  .scan-spinner span:nth-child(4) { animation-delay:0.45s; }
+  .scan-spinner span:nth-child(5) { animation-delay:0.60s; }
+  @keyframes scanbar {
+    0%,100% { transform: scaleY(0.35); opacity:0.4; }
+    50%      { transform: scaleY(1);    opacity:1;   }
+  }
+  .scan-status { font-size:11px; color:var(--muted); }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div style="text-align:center; margin-bottom:1rem;">
+    <h1>⟳ IMAP Email Cleaner</h1>
+    <div class="tagline">connect · preview · delete — with rate-limit handling</div>
+  </div>
+
+  <!-- ── Connection Panel ── -->
+  <div class="panel" id="conn-panel">
+    <div class="panel-head">
+      <span class="panel-title">imap connection</span>
+      <span id="conn-status"></span>
+    </div>
+    <div class="panel-body">
+      <div class="field-row cols-3">
+        <div>
+          <label>hostname</label>
+          <input type="text" id="host" placeholder="imap.example.com" />
+        </div>
+        <div>
+          <label>port</label>
+          <input type="number" id="port" placeholder="993" value="993" />
+        </div>
+        <div class="tls-row">
+          <input type="checkbox" id="tls" checked />
+          <span onclick="document.getElementById('tls').click()">TLS</span>
+        </div>
+      </div>
+      <div class="field-row cols-2">
+        <div>
+          <label>username / email</label>
+          <input type="text" id="user" placeholder="you@example.com" autocomplete="username" />
+        </div>
+        <div>
+          <label>password</label>
+          <input type="password" id="password" placeholder="••••••••••••" autocomplete="current-password" />
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn-primary" id="connect-btn" onclick="testConnect()">connect →</button>
+        <button class="btn-ghost" id="folders-btn" onclick="loadFolders()" disabled>load folders</button>
+      </div>
+      <div class="notice">
+        Credentials are sent only to your local Node.js server and never leave your machine.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Filter Panel ── -->
+  <div class="panel hidden" id="filter-panel">
+    <div class="panel-head">
+      <span class="panel-title">filter criteria</span>
+    </div>
+    <div class="panel-body">
+      <div class="field-row cols-4">
+        <div>
+          <label>older than</label>
+          <input type="number" id="age-val" value="30" min="1" />
+        </div>
+        <div>
+          <label>unit</label>
+          <select id="age-unit">
+            <option value="days">days</option>
+            <option value="weeks">weeks</option>
+            <option value="months" selected>months</option>
+            <option value="years">years</option>
+          </select>
+        </div>
+        <div>
+          <label>folder</label>
+          <select id="folder-select">
+            <option value="INBOX">INBOX</option>
+          </select>
+        </div>
+        <div>
+          <label>read status</label>
+          <div class="seg-group">
+            <button class="active" data-val="all" onclick="setReadFilter(this)">all</button>
+            <button data-val="unread" onclick="setReadFilter(this)">unread</button>
+            <button data-val="read" onclick="setReadFilter(this)">read</button>
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn-primary" id="scan-btn" onclick="startScan()">scan →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Preview / Delete Panel ── -->
+  <div class="panel hidden" id="preview-panel">
+    <div class="panel-head">
+      <span class="panel-title">preview</span>
+      <div id="preview-stats" style="display:flex;gap:16px;font-size:11px;color:var(--muted);">
+        <span><span id="stat-count" style="color:var(--text);font-weight:500;">0</span> emails</span>
+        <span><span id="stat-size" style="color:var(--text);font-weight:500;">0 B</span> total</span>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="scan-progress hidden" id="scan-progress">
+        <div class="scan-spinner"><span></span><span></span><span></span><span></span><span></span></div>
+        <span class="scan-status" id="scan-status-txt">connecting…</span>
+      </div>
+      <div class="email-table-wrap">
+        <table>
+          <colgroup>
+            <col class="col-read" />
+            <col class="col-from" />
+            <col /> <!-- subject fills -->
+            <col class="col-date" />
+            <col class="col-size" />
+            <col class="col-row-status" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th></th>
+              <th>from</th>
+              <th>subject</th>
+              <th>date</th>
+              <th style="text-align:right;">size</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="email-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- rate limit banner -->
+      <div class="rate-banner hidden" id="rate-banner">
+        <span class="dot pulse"></span>
+        <span id="rate-msg">rate limited — backing off</span>
+      </div>
+
+      <!-- progress -->
+      <div class="progress-area hidden" id="progress-area">
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="progress-fill"></div>
+        </div>
+        <div class="progress-stats">
+          <span id="progress-left"></span>
+          <span id="progress-right"></span>
+        </div>
+      </div>
+
+      <div class="btn-row" style="margin-top:14px;">
+        <button class="btn-danger" id="delete-btn" onclick="startDelete()" disabled>delete all →</button>
+        <button class="btn-ghost" id="stop-btn" onclick="stopDelete()" disabled>stop</button>
+        <button class="btn-ghost" onclick="resetPreview()">← back</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "";
+let readFilter = "all";
+let scannedEmails = [];
+let totalSize = 0;
+let deleteSSE = null;
+let stopRequested = false;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const creds = () => ({
+  host: $("host").value.trim(),
+  port: $("port").value.trim(),
+  tls:  $("tls").checked,
+  user: $("user").value.trim(),
+  password: $("password").value,
+});
+const qs = (obj) => new URLSearchParams(obj).toString();
+
+function setStatus(id, type, text) {
+  const el = $(id);
+  el.className = `status-pill pill-${type}`;
+  el.innerHTML = `<span class="dot"></span>${text}`;
+}
+
+function setReadFilter(btn) {
+  document.querySelectorAll(".seg-group button").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  readFilter = btn.dataset.val;
+}
+
+// ── test connection ───────────────────────────────────────────────────────────
+async function testConnect() {
+  const btn = $("connect-btn");
+  btn.disabled = true; btn.textContent = "connecting…";
+  setStatus("conn-status", "info", "connecting");
+
+  try {
+    const r = await fetch(`${API}/api/connect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(creds()),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      setStatus("conn-status", "ok", "connected");
+      $("filter-panel").classList.remove("hidden");
+      $("folders-btn").disabled = false;
+      btn.textContent = "reconnect";
+    } else {
+      setStatus("conn-status", "error", "failed");
+      alert("Connection failed: " + data.error);
+    }
+  } catch (e) {
+    setStatus("conn-status", "error", "server error");
+    alert("Cannot reach local server.\nMake sure server.js is running:\n  node server.js");
+  }
+  btn.disabled = false;
+}
+
+// ── load folders ──────────────────────────────────────────────────────────────
+async function loadFolders() {
+  const btn = $("folders-btn");
+  btn.disabled = true; btn.textContent = "loading…";
+  try {
+    const r = await fetch(`${API}/api/folders`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(creds()),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      const sel = $("folder-select");
+      sel.innerHTML = "";
+      data.folders.forEach(f => {
+        const o = document.createElement("option");
+        o.value = f; o.textContent = f;
+        if (f === "INBOX") o.selected = true;
+        sel.appendChild(o);
+      });
+    }
+  } catch (e) {}
+  btn.disabled = false; btn.textContent = "load folders";
+}
+
+// ── scan ─────────────────────────────────────────────────────────────────────
+function startScan() {
+  scannedEmails = [];
+  totalSize = 0;
+  const tbody = $("email-tbody");
+  tbody.innerHTML = "";
+  $("preview-panel").classList.remove("hidden");
+  $("delete-btn").disabled = true;
+  $("progress-area").classList.add("hidden");
+  $("rate-banner").classList.add("hidden");
+  $("scan-progress").classList.remove("hidden");
+  $("scan-status-txt").textContent = "connecting…";
+  $("stat-count").textContent = "—";
+  $("stat-size").textContent = "";
+  $("scan-btn").disabled = true;
+  $("scan-btn").textContent = "scanning…";
+
+  const params = qs({
+    ...creds(),
+    folder:    $("folder-select").value,
+    ageVal:    $("age-val").value,
+    ageUnit:   $("age-unit").value,
+    readStatus: readFilter,
+  });
+
+  const es = new EventSource(`${API}/api/scan?${params}`);
+  let first = true;
+
+  es.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+
+    if (msg.type === "status") {
+      $("scan-status-txt").textContent = msg.message;
+    }
+
+    if (msg.type === "total") {
+      $("stat-count").textContent = msg.count;
+      $("scan-status-txt").textContent = `found ${msg.count} — fetching headers…`;
+      if (first) { tbody.innerHTML = ""; first = false; }
+    }
+
+    if (msg.type === "email") {
+      if (first) { tbody.innerHTML = ""; first = false; }
+      scannedEmails.push(msg);
+      totalSize += msg.size || 0;
+      $("stat-count").textContent = scannedEmails.length;
+      $("stat-size").textContent = fmtSize(totalSize);
+      $("scan-status-txt").textContent = `fetched ${scannedEmails.length} so far…`;
+      const tr = document.createElement("tr");
+      tr.id = `row-${msg.uid}`;
+      tr.innerHTML = `
+        <td><span class="read-badge ${msg.read ? 'read' : 'unread'}"></span></td>
+        <td title="${esc(msg.from)}">${esc(msg.from)}</td>
+        <td title="${esc(msg.subject)}">${esc(msg.subject)}</td>
+        <td class="col-date">${formatDate(msg.date)}</td>
+        <td style="text-align:right;">${fmtSize(msg.size || 0)}</td>
+        <td><span class="row-tag tag-pending" id="rtag-${msg.uid}">—</span></td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    if (msg.type === "done") {
+      es.close();
+      $("scan-progress").classList.add("hidden");
+      $("scan-btn").disabled = false;
+      $("scan-btn").textContent = "scan →";
+      if (scannedEmails.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:14px;">no matching emails found</td></tr>`;
+        $("stat-count").textContent = "0";
+        $("stat-size").textContent = "";
+      } else {
+        $("stat-count").textContent = scannedEmails.length;
+        $("stat-size").textContent = fmtSize(totalSize);
+        $("delete-btn").disabled = false;
+      }
+    }
+
+    if (msg.type === "error") {
+      es.close();
+      $("scan-progress").classList.add("hidden");
+      $("scan-btn").disabled = false;
+      $("scan-btn").textContent = "scan →";
+      tbody.innerHTML = `<tr><td colspan="6" style="color:var(--danger);padding:14px;">${esc(msg.message)}</td></tr>`;
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    $("scan-progress").classList.add("hidden");
+    $("scan-btn").disabled = false;
+    $("scan-btn").textContent = "scan →";
+    if (first) tbody.innerHTML = `<tr><td colspan="6" style="color:var(--danger);text-align:center;padding:14px;">connection error — check server logs</td></tr>`;
+  };
+}
+
+// ── delete ────────────────────────────────────────────────────────────────────
+function startDelete() {
+  stopRequested = false;
+  $("delete-btn").disabled = true;
+  $("stop-btn").disabled = false;
+  $("progress-area").classList.remove("hidden");
+  $("progress-fill").style.width = "0%";
+  $("progress-fill").className = "progress-bar-fill";
+
+  const uids = scannedEmails.map(e => e.uid).filter(Boolean);
+  console.log("[delete] sending", uids.length, "UIDs:", uids.slice(0, 5), "...");
+
+  if (uids.length === 0) {
+    alert("No valid UIDs to delete — try scanning again.");
+    $("delete-btn").disabled = false;
+    $("stop-btn").disabled = true;
+    return;
+  }
+
+  // Use POST + fetch-based SSE to avoid URL length limits with large UID lists
+  const body = JSON.stringify({ ...creds(), tls: $("tls").checked, folder: $("folder-select").value, uids });
+
+  fetch(`${API}/api/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  }).then(response => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    const pump = () => reader.read().then(({ done, value }) => {
+      if (done) { $("stop-btn").disabled = true; return; }
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const part of parts) {
+        const line = part.replace(/^data: /, "").trim();
+        if (!line) continue;
+        try { handleDeleteEvent(JSON.parse(line)); } catch(e) {}
+      }
+      pump();
+    }).catch(() => { $("stop-btn").disabled = true; });
+
+    pump();
+  }).catch(err => {
+    console.error("[delete] fetch error:", err);
+    $("delete-btn").disabled = false;
+    $("stop-btn").disabled = true;
+  });
+
+  // handler is now in handleDeleteEvent()
+}
+
+function handleDeleteEvent(msg) {
+  console.log("[delete event]", msg.type, msg);
+
+  if (msg.type === "deleted") {
+    $("rate-banner").classList.add("hidden");
+    const row = $(`row-${msg.uid}`);
+    const tag = $(`rtag-${msg.uid}`);
+    if (row) row.classList.add("deleted");
+    if (tag) { tag.className = "row-tag tag-done"; tag.textContent = "deleted"; }
+    updateProgress(msg.deleted, msg.total, `${msg.deleted}/${msg.total} deleted`, `delay ${msg.delay}ms`);
+  }
+
+  if (msg.type === "status") {
+    updateProgress(0, 1, msg.message, "");
+  }
+
+  if (msg.type === "ratelimit") {
+    const secs = (msg.retryIn / 1000).toFixed(1);
+    $("rate-banner").classList.remove("hidden");
+    $("rate-msg").textContent = `rate limited — backing off ${secs}s (hit #${msg.hits})`;
+  }
+
+  if (msg.type === "skipped") {
+    const row = $(`row-${msg.uid}`);
+    const tag = $(`rtag-${msg.uid}`);
+    if (row) row.classList.add("skipped");
+    if (tag) { tag.className = "row-tag tag-skipped"; tag.textContent = "skip"; }
+  }
+
+  if (msg.type === "error") {
+    console.error("[delete] error:", msg.message);
+    if (msg.uid) {
+      const tag = $(`rtag-${msg.uid}`);
+      if (tag) { tag.className = "row-tag tag-skipped"; tag.textContent = "err"; }
+    }
+  }
+
+  if (msg.type === "done") {
+    $("stop-btn").disabled = true;
+    $("rate-banner").classList.add("hidden");
+    $("progress-fill").className = "progress-bar-fill danger";
+    updateProgress(msg.deleted, msg.total,
+      `done — ${msg.deleted} deleted`,
+      msg.rateLimitHits ? `${msg.rateLimitHits} rate-limit hit(s)` : "completed"
+    );
+  }
+}
+
+function stopDelete() {
+  if (deleteSSE) { deleteSSE.close(); deleteSSE = null; }
+  $("stop-btn").disabled = true;
+  $("rate-banner").classList.add("hidden");
+  $("progress-right").textContent = "stopped by user";
+}
+
+function updateProgress(done, total, left, right) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  $("progress-fill").style.width = pct + "%";
+  $("progress-left").textContent = left;
+  $("progress-right").textContent = right;
+}
+
+function resetPreview() {
+  if (deleteSSE) { deleteSSE.close(); deleteSSE = null; }
+  $("preview-panel").classList.add("hidden");
+  scannedEmails = [];
+  totalSize = 0;
+}
+
+// ── utils ─────────────────────────────────────────────────────────────────────
+function fmtSize(bytes) {
+  if (!bytes || bytes === 0) return "—";
+  if (bytes < 1024)                  return bytes + " B";
+  if (bytes < 1024 * 1024)           return (bytes / 1024).toFixed(1) + " KB";
+  if (bytes < 1024 * 1024 * 1024)   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+}
+
+function esc(s) {
+  return String(s || "")
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+function fmtSize(bytes) {
+  if (!bytes || bytes === 0) return "—";
+  if (bytes < 1024)        return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+function formatDate(raw) {
+  if (!raw) return "";
+  try {
+    const d = new Date(raw);
+    if (isNaN(d)) return raw.slice(0, 16);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  } catch { return raw.slice(0, 16); }
+}
+</script>
+</body>
+</html>
+
