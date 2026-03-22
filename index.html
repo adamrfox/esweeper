@@ -133,7 +133,7 @@
   .col-from   { width: 200px; }
   .col-date   { width: 140px; min-width: 140px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: visible; }
   td.col-date { overflow: visible; text-overflow: clip; }
-  .col-size   { width: 70px; color: var(--muted); font-size: 11px; text-align: right; }
+  .col-size   { width: 90px; min-width: 90px; color: var(--muted); font-size: 11px; text-align: right; white-space: nowrap; overflow: visible; }
   .col-row-status { width: 70px; text-align: right; }
 
   .read-badge {
@@ -316,7 +316,7 @@
               <th>from</th>
               <th>subject</th>
               <th>date</th>
-              <th style="text-align:right;">size</th>
+              <th style="text-align:right;">size (KB/MB)</th>
               <th></th>
             </tr>
           </thead>
@@ -490,7 +490,7 @@ function startScan() {
         <td title="${esc(msg.from)}">${esc(msg.from)}</td>
         <td title="${esc(msg.subject)}">${esc(msg.subject)}</td>
         <td class="col-date">${formatDate(msg.date)}</td>
-        <td style="text-align:right;">${fmtSize(msg.size || 0)}</td>
+        <td class="col-size">${fmtSize(msg.size || 0)}</td>
         <td><span class="row-tag tag-pending" id="rtag-${msg.uid}">—</span></td>
       `;
       tbody.appendChild(tr);
@@ -666,12 +666,7 @@ function esc(s) {
   return String(s || "")
     .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
-function fmtSize(bytes) {
-  if (!bytes || bytes === 0) return "—";
-  if (bytes < 1024)        return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-}
+
 function formatDate(raw) {
   if (!raw) return "";
   try {
