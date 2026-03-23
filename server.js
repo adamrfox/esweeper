@@ -187,15 +187,17 @@ app.post("/api/folders", async (req, res) => {
     const imap = await getConnection(cfg);
     imap.getBoxes((err, boxes) => {
       if (err) return res.json({ ok: false, error: err.message });
-      console.log("[folders] raw:", JSON.stringify(boxes, null, 2));
       const folders = [];
       const flatten = (obj, prefix) => {
         if (!obj || typeof obj !== "object") return;
         for (const [name, box] of Object.entries(obj)) {
+          if (name === "parent") continue;          // skip circular back-reference
           const sep  = (box && box.delimiter) || "/";
           const full = prefix ? `${prefix}${sep}${name}` : name;
           folders.push(full);
-          if (box && box.children) flatten(box.children, full);
+          if (box && box.children && typeof box.children === "object") {
+            flatten(box.children, full);
+          }
         }
       };
       flatten(boxes, "");
