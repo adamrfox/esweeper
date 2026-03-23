@@ -74,41 +74,81 @@ function poolKey(cfg) {
   return `${cfg.user}@${cfg.host}:${parseInt(cfg.port) || (cfg.tls ? 993 : 143)}`;
 }
 
-function getConnection(cfg) {
+const CONN_RETRIES  = 5;
+const CONN_BACKOFF  = [1000, 2000, 4000, 8000, 16000]; // ms between attempts
+
+function isTransientError(err) {
+  const msg = (err && err.message) || String(err);
+  return /ECONNRESET|EPIPE|ETIMEDOUT|ECONNREFUSED|socket|closed|read |write /i.test(msg);
+}
+
+// Opens a fresh IMAP connection, with retry/backoff on transient errors.
+function openConnection(cfg) {
   return new Promise((resolve, reject) => {
-    const key   = poolKey(cfg);
-    const entry = pool.get(key);
-
-    // Reuse existing live connection
-    if (entry && entry.imap.state !== "disconnected") {
-      console.log(`[pool] reusing connection: ${key}`);
-      resolve(entry.imap);
-      return;
-    }
-
-    // Create a fresh connection
-    if (entry) pool.delete(key);
-    console.log(`[pool] opening new connection: ${key}`);
-
+    const key = poolKey(cfg);
     const imap = makeImap(cfg);
 
     imap.once("ready", () => {
       console.log(`[pool] ready: ${key}`);
       pool.set(key, { imap });
+
+      // Keep the pool clean if this connection later drops
+      const cleanup = () => {
+        if (pool.get(key)?.imap === imap) {
+          console.log(`[pool] connection lost: ${key}`);
+          pool.delete(key);
+        }
+      };
+      imap.on("error", (err) => { console.error(`[pool] error: ${key}:`, err.message); cleanup(); });
+      imap.on("end",   cleanup);
+      imap.on("close", cleanup);
+
       resolve(imap);
     });
 
-    imap.on("error", (err) => {
-      console.error(`[pool] error on ${key}:`, err.message);
+    imap.once("error", (err) => {
+      console.error(`[pool] connect error on ${key}:`, err.message);
       pool.delete(key);
       reject(err);
     });
 
-    imap.on("end",   () => { console.log(`[pool] ended: ${key}`);  pool.delete(key); });
-    imap.on("close", () => { console.log(`[pool] closed: ${key}`); pool.delete(key); });
-
     imap.connect();
   });
+}
+
+async function getConnection(cfg) {
+  const key   = poolKey(cfg);
+  const entry = pool.get(key);
+
+  // Reuse existing live connection
+  if (entry && entry.imap.state !== "disconnected") {
+    console.log(`[pool] reusing: ${key}`);
+    return entry.imap;
+  }
+
+  if (entry) pool.delete(key);
+
+  // Attempt connection with retry/backoff
+  let lastErr;
+  for (let attempt = 0; attempt < CONN_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const wait = CONN_BACKOFF[Math.min(attempt - 1, CONN_BACKOFF.length - 1)];
+      console.log(`[pool] retry ${attempt}/${CONN_RETRIES - 1} in ${wait}ms for ${key}`);
+      await sleep(wait);
+    }
+    try {
+      return await openConnection(cfg);
+    } catch (err) {
+      lastErr = err;
+      if (isTransientError(err)) {
+        console.warn(`[pool] transient error on attempt ${attempt + 1}: ${err.message}`);
+      } else {
+        // Non-transient (auth failure, bad hostname) — don't retry
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
 }
 
 function closeConnection(cfg) {
