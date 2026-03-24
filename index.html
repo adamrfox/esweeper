@@ -585,19 +585,26 @@ function startDelete() {
 }
 
 function handleDeleteEvent(msg) {
-  console.log("[delete event]", msg.type, msg);
+  // progress — throttled counter update (every 50 deletes server-side)
+  if (msg.type === "progress") {
+    $("rate-banner").classList.add("hidden");
+    updateProgress(msg.deleted, msg.total,
+      `${msg.deleted.toLocaleString()} / ${msg.total.toLocaleString()} deleted`,
+      `${Math.round(msg.deleted / msg.total * 100)}%`
+    );
+  }
 
+  // deleted — individual row update, but only touch the DOM if the row is visible
   if (msg.type === "deleted") {
     $("rate-banner").classList.add("hidden");
     const row = $(`row-${msg.uid}`);
     const tag = $(`rtag-${msg.uid}`);
     if (row) row.classList.add("deleted");
     if (tag) { tag.className = "row-tag tag-done"; tag.textContent = "deleted"; }
-    updateProgress(msg.deleted, msg.total, `${msg.deleted}/${msg.total} deleted`, `delay ${msg.delay}ms`);
   }
 
   if (msg.type === "status") {
-    updateProgress(0, 1, msg.message, "");
+    $("progress-left").textContent = msg.message;
   }
 
   if (msg.type === "ratelimit") {
@@ -614,10 +621,11 @@ function handleDeleteEvent(msg) {
   }
 
   if (msg.type === "error") {
-    console.error("[delete] error:", msg.message);
     if (msg.uid) {
       const tag = $(`rtag-${msg.uid}`);
       if (tag) { tag.className = "row-tag tag-skipped"; tag.textContent = "err"; }
+    } else {
+      console.error("[delete] error:", msg.message);
     }
   }
 
@@ -626,7 +634,7 @@ function handleDeleteEvent(msg) {
     $("rate-banner").classList.add("hidden");
     $("progress-fill").className = "progress-bar-fill danger";
     updateProgress(msg.deleted, msg.total,
-      `done — ${msg.deleted} deleted`,
+      `done — ${msg.deleted.toLocaleString()} deleted`,
       msg.rateLimitHits ? `${msg.rateLimitHits} rate-limit hit(s)` : "completed"
     );
   }

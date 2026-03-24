@@ -22,14 +22,38 @@ app.use(express.static(path.dirname(__filename)));
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Rejects if the given promise doesn't settle within ms milliseconds
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new Error(`TIMEOUT: ${label} (${ms}ms)`));
+    }, ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e);  }
+    );
+  });
+}
+
 function sseStream(res) {
   res.setHeader("Content-Type",  "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection",    "keep-alive");
   res.flushHeaders();
+
+  // Heartbeat keeps nginx and browser from closing an idle SSE connection
+  const heartbeat = setInterval(() => {
+    try { res.write(": heartbeat\n\n"); } catch (_) {}
+  }, 15000);
+
   return {
-    send: (type, payload) => res.write(`data: ${JSON.stringify({ type, ...payload })}\n\n`),
-    end:  ()              => res.end(),
+    send: (type, payload) => {
+      try { res.write(`data: ${JSON.stringify({ type, ...payload })}\n\n`); } catch (_) {}
+    },
+    end: () => {
+      clearInterval(heartbeat);
+      res.end();
+    },
   };
 }
 
@@ -322,20 +346,21 @@ app.post("/api/delete", async (req, res) => {
   // Delete gets its own fresh connection — don't share with scan/browse
   closeConnection(cfg);
 
-  let deleted         = 0;
-  let rateLimitHits   = 0;
-  let delay           = RATE.baseDelay;
-  let remaining       = [...allUids];
-  let sinceExpunge    = 0;
-  const EXPUNGE_EVERY = 500;
-  const MAX_RECONNECTS = 10;
-  let reconnects      = 0;
+  let deleted          = 0;
+  let rateLimitHits    = 0;
+  let remaining        = [...allUids];
+  let sinceExpunge     = 0;
+  const BATCH_SIZE     = 100;   // flag this many UIDs per IMAP command
+  const EXPUNGE_EVERY  = 1000;  // expunge after this many deletes
+  const MAX_RECONNECTS = 50;    // keep retrying — large jobs need many reconnects
+  let reconnects       = 0;
 
   const runDelete = () => new Promise((resolve, reject) => {
     const imap = makeImap(cfg);
 
     imap.on("error", (err) => {
       console.error(`[delete] imap error:`, err.message);
+      // Only reject if we haven't already resolved/rejected
       reject(err);
     });
 
@@ -344,39 +369,60 @@ app.post("/api/delete", async (req, res) => {
       imap.openBox(folder || "INBOX", false, async (err) => {
         if (err) { reject(err); return; }
         console.log(`[delete] box open — ${remaining.length} remaining`);
-        send("status", { message: `starting deletion — ${remaining.length} messages…` });
+        send("status", { message: `deleting — ${remaining.length} messages remaining…` });
 
         while (remaining.length > 0) {
-          const uid     = remaining[0];
+          // Take a batch of UIDs and flag them all in one IMAP command
+          const batch   = remaining.slice(0, BATCH_SIZE);
           let   success = false;
           let   retries = 0;
 
           while (!success && retries < 5) {
-            await sleep(delay + Math.random() * RATE.jitter);
             try {
-              await new Promise((res2, rej2) => {
-                imap.addFlags(uid, "\\Deleted", (e) => e ? rej2(e) : res2());
-              });
+              // Pass batch as an array — node-imap addFlags() is UID-based
+              // and accepts an array of UIDs as the message source
+              await withTimeout(
+                new Promise((res2, rej2) => {
+                  imap.addFlags(batch, ["\\Deleted"], (e) => {
+                    if (e) {
+                      console.error(`[delete] addFlags error:`, e.message);
+                      rej2(e);
+                    } else {
+                      res2();
+                    }
+                  });
+                }),
+                60000,
+                `addFlags timed out for batch of ${batch.length}`
+              );
 
-              remaining.shift();
-              success = true;
-              deleted++;
-              sinceExpunge++;
-              delay = Math.max(RATE.baseDelay, delay * 0.9);
+              // Batch succeeded — remove from remaining
+              remaining.splice(0, batch.length);
+              success  = true;
+              deleted += batch.length;
+              sinceExpunge += batch.length;
 
-              if (deleted % 100 === 0)
+              if (deleted % 500 === 0 || remaining.length === 0)
                 console.log(`[delete] ${deleted}/${allUids.length} (${remaining.length} left)`);
 
-              send("deleted", { uid, deleted, total: allUids.length, delay: Math.round(delay) });
+              send("progress", { deleted, total: allUids.length, delay: 0 });
+
+              // Small pause between batches to be a good IMAP citizen
+              if (remaining.length > 0) await sleep(200 + Math.random() * 100);
 
               // Periodic expunge
               if (sinceExpunge >= EXPUNGE_EVERY) {
                 console.log(`[delete] periodic expunge at ${deleted}…`);
-                send("status", { message: `expunging batch (${deleted}/${allUids.length} done)…` });
-                await new Promise(r => imap.expunge(e => {
-                  if (e) console.warn(`[delete] periodic expunge warning:`, e.message);
-                  r();
-                }));
+                send("status", { message: `expunging (${deleted.toLocaleString()}/${allUids.length.toLocaleString()} done)…` });
+                await withTimeout(
+                  new Promise(r => imap.expunge(e => {
+                    if (e) console.error(`[delete] expunge error:`, e.message);
+                    else console.log(`[delete] expunge ok`);
+                    r();
+                  })),
+                  60000,
+                  "expunge timed out"
+                );
                 sinceExpunge = 0;
               }
 
@@ -386,22 +432,23 @@ app.post("/api/delete", async (req, res) => {
               const isRateLimit = /rate|too many|slow down|THROTTL|\[UNAVAILABLE\]/i.test(msg);
 
               if (isConnDrop) {
-                console.warn(`[delete] connection dropped at UID ${uid}: ${msg}`);
-                send("ratelimit", { uid, retryIn: 3000, hits: ++rateLimitHits, message: "Connection dropped — reconnecting…" });
+                console.warn(`[delete] connection/timeout on batch: ${msg} — reconnecting`);
+                send("ratelimit", { retryIn: 3000, hits: ++rateLimitHits, message: `Connection dropped after ${deleted.toLocaleString()} — reconnecting…` });
                 try { imap.destroy(); } catch (_) {}
                 reject(new Error("RECONNECT"));
                 return;
               } else if (isRateLimit) {
                 rateLimitHits++;
-                delay = Math.min(delay * RATE.backoffFactor, RATE.maxDelay);
-                const secs = (delay / 1000).toFixed(1);
-                console.warn(`[delete] rate limit #${rateLimitHits} on UID ${uid}, backing off ${secs}s`);
-                send("ratelimit", { uid, retryIn: Math.round(delay), hits: rateLimitHits, message: `Rate limited — waiting ${secs}s` });
-                await sleep(delay);
+                const wait = Math.min(5000 * rateLimitHits, 60000);
+                const secs = (wait / 1000).toFixed(0);
+                console.warn(`[delete] rate limit #${rateLimitHits}, backing off ${secs}s`);
+                send("ratelimit", { retryIn: wait, hits: rateLimitHits, message: `Rate limited — waiting ${secs}s` });
+                await sleep(wait);
               } else {
-                console.error(`[delete] error on UID ${uid}:`, msg);
-                send("error", { uid, message: msg.slice(0, 80) });
-                remaining.shift();
+                // Non-retryable error on this batch — skip it and move on
+                console.error(`[delete] error on batch, skipping ${batch.length} UIDs:`, msg);
+                send("error", { message: `Skipped ${batch.length} messages: ${msg.slice(0, 80)}` });
+                remaining.splice(0, batch.length);
                 break;
               }
               retries++;
@@ -409,43 +456,87 @@ app.post("/api/delete", async (req, res) => {
           }
 
           if (!success && retries >= 5) {
-            console.warn(`[delete] UID ${uid} skipped after max retries`);
-            send("skipped", { uid, reason: "max retries exceeded" });
-            remaining.shift();
+            console.warn(`[delete] batch skipped after max retries, skipping ${batch.length} UIDs`);
+            send("skipped", { reason: `batch of ${batch.length} skipped after max retries` });
+            remaining.splice(0, batch.length);
           }
         }
 
-        // Final expunge
-        console.log(`[delete] final expunge…`);
-        send("status", { message: "final expunge…" });
-        imap.expunge((e) => {
-          if (e) send("warning", { message: `Expunge warning: ${e.message}` });
-          imap.end();
-          resolve();
-        });
+        // closeBox(true) expunges all \Deleted messages and closes —
+        // more reliable than a separate EXPUNGE command
+        console.log(`[delete] closing box with expunge…`);
+        send("status", { message: "expunging and closing…" });
+        try {
+          await withTimeout(
+            new Promise(r => imap.closeBox(true, (e) => {
+              if (e) console.warn(`[delete] closeBox warning:`, e.message);
+              r();
+            })),
+            120000,
+            "closeBox timed out"
+          );
+        } catch (e) {
+          console.warn(`[delete] closeBox error:`, e.message);
+          send("warning", { message: `Close warning: ${e.message}` });
+        }
+        imap.end();
+        resolve();
       });
     });
 
     imap.connect();
   });
 
-  // Outer reconnect loop
-  while (remaining.length > 0 && reconnects <= MAX_RECONNECTS) {
+  // Outer reconnect loop — keeps retrying until done or MAX_RECONNECTS
+  // consecutive failures with no progress between them.
+  // Uses exponential backoff starting at 15s so the server has time to
+  // cool down before we attempt to re-authenticate.
+  let consecutiveFailures = 0;
+  const BASE_RECONNECT_WAIT = 15000;  // start at 15s — gives server time to recover
+  const MAX_RECONNECT_WAIT  = 120000; // cap at 2 minutes
+
+  while (remaining.length > 0 && consecutiveFailures <= MAX_RECONNECTS) {
+    const progressBefore = deleted;
     try {
       await runDelete();
-      break;
+      break; // finished cleanly
     } catch (err) {
-      if (err.message === "RECONNECT" && remaining.length > 0) {
-        reconnects++;
-        const wait = Math.min(3000 * reconnects, 30000);
-        console.log(`[delete] reconnect #${reconnects} in ${wait}ms, ${remaining.length} left`);
-        send("ratelimit", { retryIn: wait, hits: rateLimitHits, message: `Reconnecting (attempt ${reconnects})… ${remaining.length} messages left` });
-        await sleep(wait);
+      const isReconnect  = err.message === "RECONNECT";
+      const isAuthFail   = /auth|login|timeout.*auth|authenticat/i.test(err.message);
+      const madeProgress = deleted > progressBefore;
+
+      if (madeProgress) {
+        // Reset consecutive failure count whenever we make progress
+        consecutiveFailures = 0;
       } else {
+        consecutiveFailures++;
+      }
+
+      if ((isReconnect || isAuthFail) && remaining.length > 0) {
+        reconnects++;
+        // Exponential backoff — longer waits give the server more recovery time
+        const wait = Math.min(BASE_RECONNECT_WAIT * Math.pow(1.8, consecutiveFailures), MAX_RECONNECT_WAIT);
+        const secs = Math.round(wait / 1000);
+        console.log(`[delete] reconnect #${reconnects} (${consecutiveFailures} consecutive failures) — waiting ${secs}s, ${remaining.length} remaining`);
+        send("ratelimit", {
+          retryIn: wait,
+          hits: rateLimitHits,
+          message: `Server cooling down — waiting ${secs}s before retry (${remaining.length.toLocaleString()} messages left)`,
+        });
+        await sleep(wait);
+        console.log(`[delete] attempting reconnect #${reconnects}…`);
+      } else {
+        // Unrecoverable error
+        console.error(`[delete] unrecoverable error:`, err.message);
         send("error", { message: err.message });
         break;
       }
     }
+  }
+
+  if (consecutiveFailures > MAX_RECONNECTS) {
+    console.error(`[delete] gave up after ${MAX_RECONNECTS} consecutive failed reconnects`);
+    send("error", { message: `Gave up after ${MAX_RECONNECTS} failed reconnects — ${deleted.toLocaleString()} of ${allUids.length.toLocaleString()} deleted. Try running again to continue.` });
   }
 
   console.log(`[delete] complete — ${deleted}/${allUids.length} deleted, ${reconnects} reconnects`);
