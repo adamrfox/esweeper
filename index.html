@@ -131,6 +131,13 @@
   .col-status { width: 28px; text-align: center; }
   .col-read   { width: 26px; text-align: center; }
   .col-from   { width: 200px; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th.sortable .sort-arrow { margin-left: 4px; opacity: 0.35; font-style: normal; }
+  th.sortable.asc  .sort-arrow::after { content: "↑"; opacity: 1; }
+  th.sortable.desc .sort-arrow::after { content: "↓"; opacity: 1; }
+  th.sortable:not(.asc):not(.desc) .sort-arrow::after { content: "↕"; }
+
   .col-date   { width: 140px; min-width: 140px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: visible; }
   td.col-date { overflow: visible; text-overflow: clip; }
   .col-size   { width: 90px; min-width: 90px; color: var(--muted); font-size: 11px; text-align: right; white-space: nowrap; overflow: visible; }
@@ -251,7 +258,24 @@
       <span class="panel-title">filter criteria</span>
     </div>
     <div class="panel-body">
-      <div class="field-row cols-4">
+      <div class="field-row cols-2" style="margin-bottom:10px;">
+        <div>
+          <label>date filter mode</label>
+          <div class="seg-group">
+            <button class="active" data-mode="older" onclick="setFilterMode(this)">older than</button>
+            <button data-mode="between" onclick="setFilterMode(this)">between dates</button>
+          </div>
+        </div>
+        <div>
+          <label>folder</label>
+          <select id="folder-select">
+            <option value="INBOX">INBOX</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- older than controls -->
+      <div id="mode-older" class="field-row cols-3" style="margin-bottom:10px;">
         <div>
           <label>older than</label>
           <input type="number" id="age-val" value="30" min="1" />
@@ -266,10 +290,24 @@
           </select>
         </div>
         <div>
-          <label>folder</label>
-          <select id="folder-select">
-            <option value="INBOX">INBOX</option>
-          </select>
+          <label>read status</label>
+          <div class="seg-group">
+            <button class="active" data-val="all" onclick="setReadFilter(this)">all</button>
+            <button data-val="unread" onclick="setReadFilter(this)">unread</button>
+            <button data-val="read" onclick="setReadFilter(this)">read</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- between dates controls -->
+      <div id="mode-between" class="field-row cols-3 hidden" style="margin-bottom:10px;">
+        <div>
+          <label>from date</label>
+          <input type="date" id="date-from" />
+        </div>
+        <div>
+          <label>to date</label>
+          <input type="date" id="date-to" />
         </div>
         <div>
           <label>read status</label>
@@ -280,6 +318,7 @@
           </div>
         </div>
       </div>
+
       <div class="btn-row">
         <button class="btn-primary" id="scan-btn" onclick="startScan()">scan →</button>
       </div>
@@ -291,7 +330,7 @@
     <div class="panel-head">
       <span class="panel-title">preview</span>
       <div id="preview-stats" style="display:flex;gap:16px;font-size:11px;color:var(--muted);">
-        <span><span id="stat-count" style="color:var(--text);font-weight:500;">0</span> emails</span>
+        <span><span id="stat-count" style="color:var(--text);font-weight:500;">0</span> fetched</span>
         <span><span id="stat-size" style="color:var(--text);font-weight:500;">0 B</span> total</span>
       </div>
     </div>
@@ -313,10 +352,10 @@
           <thead>
             <tr>
               <th></th>
-              <th>from</th>
-              <th>subject</th>
-              <th>date</th>
-              <th style="text-align:right;">size (KB/MB)</th>
+              <th class="sortable" data-col="from" onclick="sortTable('from')">from<i class="sort-arrow"></i></th>
+              <th class="sortable" data-col="subject" onclick="sortTable('subject')">subject<i class="sort-arrow"></i></th>
+              <th class="sortable" data-col="date" onclick="sortTable('date')">date<i class="sort-arrow"></i></th>
+              <th class="sortable" data-col="size" style="text-align:right;" onclick="sortTable('size')">size (KB/MB)<i class="sort-arrow"></i></th>
               <th></th>
             </tr>
           </thead>
@@ -343,18 +382,22 @@
 
       <div class="btn-row" style="margin-top:14px;">
         <button class="btn-danger" id="delete-btn" onclick="startDelete()" disabled>delete all →</button>
+        <button class="btn-ghost" id="archive-btn" onclick="startArchive()" disabled>archive to mbox →</button>
         <button class="btn-ghost" id="stop-btn" onclick="stopDelete()" disabled>stop</button>
         <button class="btn-ghost" onclick="resetPreview()">← back</button>
       </div>
+      <div class="notice hidden" id="archive-notice"></div>
     </div>
   </div>
 </div>
 
 <script>
 const API = "";
-let readFilter = "all";
+let readFilter  = "all";
+let filterMode  = "older";
 let scannedEmails = [];
 let totalSize = 0;
+let scanTotal = 0;   // total found by server search
 let deleteSSE = null;
 let stopRequested = false;
 
@@ -374,6 +417,28 @@ function setStatus(id, type, text) {
   el.className = `status-pill pill-${type}`;
   el.innerHTML = `<span class="dot"></span>${text}`;
 }
+
+function setFilterMode(btn) {
+  document.querySelectorAll("[data-mode]").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  filterMode = btn.dataset.mode;
+  $("mode-older").classList.toggle("hidden",   filterMode !== "older");
+  $("mode-between").classList.toggle("hidden", filterMode !== "between");
+}
+
+// Set sensible default dates for the between-dates picker
+(function() {
+  const today = new Date();
+  const month = new Date(today);
+  month.setMonth(today.getMonth() - 1);
+  const fmt = d => d.toISOString().slice(0, 10);
+  document.addEventListener("DOMContentLoaded", () => {
+    const df = $("date-from");
+    const dt = $("date-to");
+    if (df) df.value = fmt(month);
+    if (dt) dt.value = fmt(today);
+  });
+})();
 
 function setReadFilter(btn) {
   document.querySelectorAll(".seg-group button").forEach(b => b.classList.remove("active"));
@@ -439,6 +504,7 @@ async function loadFolders() {
 function startScan() {
   scannedEmails = [];
   totalSize = 0;
+  scanTotal = 0;
   const tbody = $("email-tbody");
   tbody.innerHTML = "";
   $("preview-panel").classList.remove("hidden");
@@ -452,13 +518,36 @@ function startScan() {
   $("scan-btn").disabled = true;
   $("scan-btn").textContent = "scanning…";
 
-  const params = qs({
+  const baseParams = {
     ...creds(),
-    folder:    $("folder-select").value,
-    ageVal:    $("age-val").value,
-    ageUnit:   $("age-unit").value,
+    folder:     $("folder-select").value,
     readStatus: readFilter,
-  });
+    filterMode,
+  };
+  if (filterMode === "between") {
+    const from = $("date-from").value;
+    const to   = $("date-to").value;
+    if (!from || !to) {
+      alert("Please set both a from and to date.");
+      $("scan-btn").disabled = false;
+      $("scan-btn").textContent = "scan →";
+      $("scan-progress").classList.add("hidden");
+      return;
+    }
+    if (from > to) {
+      alert("From date must be before to date.");
+      $("scan-btn").disabled = false;
+      $("scan-btn").textContent = "scan →";
+      $("scan-progress").classList.add("hidden");
+      return;
+    }
+    baseParams.dateFrom = from;
+    baseParams.dateTo   = to;
+  } else {
+    baseParams.ageVal  = $("age-val").value;
+    baseParams.ageUnit = $("age-unit").value;
+  }
+  const params = qs(baseParams);
 
   const es = new EventSource(`${API}/api/scan?${params}`);
   let first = true;
@@ -471,8 +560,9 @@ function startScan() {
     }
 
     if (msg.type === "total") {
-      $("stat-count").textContent = msg.count;
-      $("scan-status-txt").textContent = `found ${msg.count} — fetching headers…`;
+      scanTotal = msg.count;
+      $("stat-count").textContent = `0 / ${msg.count.toLocaleString()}`;
+      $("scan-status-txt").textContent = `found ${msg.count.toLocaleString()} — fetching headers…`;
       if (first) { tbody.innerHTML = ""; first = false; }
     }
 
@@ -480,9 +570,12 @@ function startScan() {
       if (first) { tbody.innerHTML = ""; first = false; }
       scannedEmails.push(msg);
       totalSize += msg.size || 0;
-      $("stat-count").textContent = scannedEmails.length;
+      const countTxt = scanTotal > 0
+        ? `${scannedEmails.length.toLocaleString()} / ${scanTotal.toLocaleString()}`
+        : scannedEmails.length.toLocaleString();
+      $("stat-count").textContent = countTxt;
       $("stat-size").textContent = fmtSize(totalSize);
-      $("scan-status-txt").textContent = `fetched ${scannedEmails.length} so far…`;
+      $("scan-status-txt").textContent = `fetched ${scannedEmails.length.toLocaleString()}${scanTotal ? ` of ${scanTotal.toLocaleString()}` : ""}…`;
       const tr = document.createElement("tr");
       tr.id = `row-${msg.uid}`;
       tr.innerHTML = `
@@ -506,9 +599,13 @@ function startScan() {
         $("stat-count").textContent = "0";
         $("stat-size").textContent = "";
       } else {
-        $("stat-count").textContent = scannedEmails.length;
+        const finalTxt = scanTotal > 0 && scanTotal !== scannedEmails.length
+          ? `${scannedEmails.length.toLocaleString()} / ${scanTotal.toLocaleString()}`
+          : scannedEmails.length.toLocaleString();
+        $("stat-count").textContent = finalTxt;
         $("stat-size").textContent = fmtSize(totalSize);
         $("delete-btn").disabled = false;
+        $("archive-btn").disabled = false;
       }
     }
 
@@ -647,6 +744,69 @@ function stopDelete() {
   $("progress-right").textContent = "stopped by user";
 }
 
+// ── table sorting ────────────────────────────────────────────────────────────
+let sortCol = null;
+let sortDir = "asc";
+
+function sortTable(col) {
+  if (sortCol === col) {
+    sortDir = sortDir === "asc" ? "desc" : "asc";
+  } else {
+    sortCol = col;
+    sortDir = col === "date" || col === "size" ? "desc" : "asc"; // sensible defaults
+  }
+
+  // Update header indicators
+  document.querySelectorAll("th.sortable").forEach(th => {
+    th.classList.remove("asc", "desc");
+    if (th.dataset.col === col) th.classList.add(sortDir);
+  });
+
+  // Sort scannedEmails
+  scannedEmails.sort((a, b) => {
+    let av, bv;
+    if (col === "from")    { av = (a.from    || "").toLowerCase(); bv = (b.from    || "").toLowerCase(); }
+    if (col === "subject") { av = (a.subject || "").toLowerCase(); bv = (b.subject || "").toLowerCase(); }
+    if (col === "size")    { av = a.size || 0;                     bv = b.size || 0; }
+    if (col === "date")    {
+      av = a.date ? new Date(a.date).getTime() : 0;
+      bv = b.date ? new Date(b.date).getTime() : 0;
+    }
+    if (av < bv) return sortDir === "asc" ? -1 :  1;
+    if (av > bv) return sortDir === "asc" ?  1 : -1;
+    return 0;
+  });
+
+  // Re-render tbody preserving row state (deleted/skipped classes and tags)
+  const tbody = $("email-tbody");
+  const rowStates = {};
+  tbody.querySelectorAll("tr[id]").forEach(tr => {
+    const tag = tr.querySelector(".row-tag");
+    rowStates[tr.id] = {
+      classes: [...tr.classList].filter(c => c !== ""),
+      tagClass: tag ? tag.className : "",
+      tagText:  tag ? tag.textContent : "",
+    };
+  });
+
+  tbody.innerHTML = "";
+  for (const msg of scannedEmails) {
+    const tr = document.createElement("tr");
+    tr.id = `row-${msg.uid}`;
+    const state = rowStates[tr.id];
+    if (state) state.classes.forEach(c => tr.classList.add(c));
+    tr.innerHTML = `
+      <td><span class="read-badge ${msg.read ? "read" : "unread"}"></span></td>
+      <td title="${esc(msg.from)}">${esc(msg.from)}</td>
+      <td title="${esc(msg.subject)}">${esc(msg.subject)}</td>
+      <td class="col-date">${formatDate(msg.date)}</td>
+      <td class="col-size">${fmtSize(msg.size || 0)}</td>
+      <td><span class="row-tag ${state ? state.tagClass : "tag-pending"}" id="rtag-${msg.uid}">${state ? state.tagText : "—"}</span></td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
 function updateProgress(done, total, left, right) {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   $("progress-fill").style.width = pct + "%";
@@ -654,11 +814,130 @@ function updateProgress(done, total, left, right) {
   $("progress-right").textContent = right;
 }
 
+async function startArchive() {
+  const uids = scannedEmails.map(e => e.uid).filter(Boolean);
+  if (uids.length === 0) { alert("No messages to archive — scan first."); return; }
+
+  $("archive-btn").disabled = true;
+  $("delete-btn").disabled  = true;
+  $("stop-btn").disabled    = true;
+  $("progress-area").classList.remove("hidden");
+  $("progress-fill").style.width  = "0%";
+  $("progress-fill").className    = "progress-bar-fill";
+  $("progress-left").textContent  = `starting archive of ${uids.length.toLocaleString()} messages…`;
+  $("progress-right").textContent = "0 MB";
+
+  const requestBody = JSON.stringify({
+    ...creds(),
+    tls:    $("tls").checked,
+    folder: $("folder-select").value,
+    uids,
+  });
+
+  let jobId = null;
+
+  try {
+    const response = await fetch(`${API}/api/archive/start`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    requestBody,
+    });
+
+    if (!response.ok) throw new Error(`Server error: ${response.status}`);
+
+    const reader  = response.body.getReader();
+    const decoder = new TextDecoder();
+    let   buf     = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const part of parts) {
+        const line = part.replace(/^data: /, "").trim();
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+
+        if (msg.type === "started")  { jobId = msg.jobId; }
+        if (msg.type === "progress") {
+          const pct = Math.round(msg.written / msg.total * 100);
+          $("progress-fill").style.width  = pct + "%";
+          $("progress-left").textContent  = `archiving ${msg.written.toLocaleString()} / ${msg.total.toLocaleString()} messages…`;
+          $("progress-right").textContent = `${msg.sizeMB.toFixed(1)} MB`;
+        }
+        if (msg.type === "reconnect") {
+          const secs = Math.round(msg.retryIn / 1000);
+          $("progress-left").textContent = `connection dropped — reconnecting in ${secs}s (${msg.remaining.toLocaleString()} remaining)…`;
+        }
+        if (msg.type === "warning") { console.warn("[archive]", msg.message); }
+        if (msg.type === "done") {
+          $("progress-fill").style.width  = "100%";
+          $("progress-right").textContent = `${msg.sizeMB.toFixed(1)} MB`;
+          $("progress-left").textContent  = msg.error
+            ? `done with errors — ${msg.written.toLocaleString()}/${msg.total.toLocaleString()} messages`
+            : `archive ready — ${msg.written.toLocaleString()} messages, ${msg.sizeMB.toFixed(1)} MB`;
+          jobId = msg.jobId;
+        }
+      }
+    }
+
+    if (jobId) {
+      const defaultName = `archive-${new Date().toISOString().slice(0,10)}.mbox`;
+      const dlUrl = `${API}/api/archive/download/${jobId}`;
+      $("progress-left").textContent += " — choose where to save…";
+
+      if (window.showSaveFilePicker) {
+        try {
+          const fileHandle = await window.showSaveFilePicker({
+            suggestedName: defaultName,
+            types: [{ description: "Mbox mail archive", accept: { "application/mbox": [".mbox"] } }],
+          });
+          const dl       = await fetch(dlUrl);
+          const writable = await fileHandle.createWritable();
+          const rdr      = dl.body.getReader();
+          let   dlBytes  = 0;
+          while (true) {
+            const { done, value } = await rdr.read();
+            if (done) break;
+            await writable.write(value);
+            dlBytes += value.length;
+            $("progress-right").textContent = `${(dlBytes/1024/1024).toFixed(1)} MB saved`;
+          }
+          await writable.close();
+          $("progress-left").textContent = `saved to ${fileHandle.name}`;
+        } catch (e) {
+          if (e.name !== "AbortError") triggerDownload(dlUrl, defaultName);
+        }
+      } else {
+        triggerDownload(dlUrl, defaultName);
+        $("progress-left").textContent += " — download started";
+      }
+    }
+
+  } catch (err) {
+    console.error("[archive] error:", err);
+    $("progress-left").textContent = `archive failed: ${err.message}`;
+    $("progress-fill").className   = "progress-bar-fill danger";
+  }
+
+  $("archive-btn").disabled = false;
+  $("delete-btn").disabled  = false;
+}
+
+function triggerDownload(url, filename) {
+  const a = Object.assign(document.createElement("a"), { href: url, download: filename });
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
 function resetPreview() {
   if (deleteSSE) { deleteSSE.close(); deleteSSE = null; }
   $("preview-panel").classList.add("hidden");
   scannedEmails = [];
   totalSize = 0;
+  scanTotal = 0;
 }
 
 // ── utils ─────────────────────────────────────────────────────────────────────

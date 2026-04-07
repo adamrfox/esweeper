@@ -59,16 +59,35 @@ function sseStream(res) {
 
 const RATE = { baseDelay: 300, backoffFactor: 2, maxDelay: 30000, jitter: 150 };
 
-function buildSearchCriteria(ageVal, ageUnit, readStatus) {
-  const now    = new Date();
-  const cutoff = new Date(now);
-  if      (ageUnit === "days")   cutoff.setDate(now.getDate() - ageVal);
-  else if (ageUnit === "weeks")  cutoff.setDate(now.getDate() - ageVal * 7);
-  else if (ageUnit === "months") cutoff.setMonth(now.getMonth() - ageVal);
-  else if (ageUnit === "years")  cutoff.setFullYear(now.getFullYear() - ageVal);
+function imapDate(d) {
   const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-  const before = `${cutoff.getDate()}-${months[cutoff.getMonth()]}-${cutoff.getFullYear()}`;
-  const criteria = [["BEFORE", before]];
+  return `${d.getDate()}-${months[d.getMonth()]}-${d.getFullYear()}`;
+}
+
+// mode: "older" | "between"
+// older:   ageVal + ageUnit
+// between: dateFrom + dateTo (ISO date strings)
+function buildSearchCriteria({ mode, ageVal, ageUnit, dateFrom, dateTo, readStatus }) {
+  const criteria = [];
+
+  if (mode === "between") {
+    // IMAP SINCE is inclusive, BEFORE is exclusive — add one day to dateTo
+    const from = new Date(dateFrom);
+    const to   = new Date(dateTo);
+    to.setDate(to.getDate() + 1);
+    criteria.push(["SINCE",  imapDate(from)]);
+    criteria.push(["BEFORE", imapDate(to)]);
+  } else {
+    // Default: older than N units
+    const now    = new Date();
+    const cutoff = new Date(now);
+    if      (ageUnit === "days")   cutoff.setDate(now.getDate() - ageVal);
+    else if (ageUnit === "weeks")  cutoff.setDate(now.getDate() - ageVal * 7);
+    else if (ageUnit === "months") cutoff.setMonth(now.getMonth() - ageVal);
+    else if (ageUnit === "years")  cutoff.setFullYear(now.getFullYear() - ageVal);
+    criteria.push(["BEFORE", imapDate(cutoff)]);
+  }
+
   if (readStatus === "unread") criteria.push("UNSEEN");
   if (readStatus === "read")   criteria.push("SEEN");
   return criteria;
@@ -243,92 +262,177 @@ app.get("/api/scan", async (req, res) => {
   console.log(`[scan] ${user}@${host} folder=${folder}`);
   send("status", { message: "connecting…" });
 
-  let imap;
-  try {
-    imap = await getConnection(cfg);
-  } catch (err) {
-    send("error", { message: err.message });
-    res.end();
-    return;
-  }
+  const { dateFrom, dateTo, filterMode } = req.query;
+  const criteria = buildSearchCriteria({
+    mode:       filterMode || "older",
+    ageVal:     parseInt(ageVal) || 30,
+    ageUnit:    ageUnit || "days",
+    dateFrom:   dateFrom || "",
+    dateTo:     dateTo   || "",
+    readStatus: readStatus || "all",
+  });
 
-  send("status", { message: "connected — opening folder…" });
+  // State that persists across reconnects
+  let allUids    = null;   // set after first successful search
+  let allEmails  = [];
+  let remaining  = null;   // UIDs not yet fetched
+  let reconnects = 0;
+  const MAX_SCAN_RECONNECTS = 20;
+  const RECONNECT_WAIT      = 10000;
 
-  imap.openBox(folder || "INBOX", true, (err) => {
-    if (err) { send("error", { message: err.message }); res.end(); return; }
+  const runScan = () => new Promise((resolve, reject) => {
+    // Always open a fresh connection for scan — don't share with pool
+    const imap = makeImap(cfg);
 
-    send("status", { message: "searching for matching messages…" });
-    const criteria = buildSearchCriteria(parseInt(ageVal) || 30, ageUnit || "days", readStatus || "all");
-    console.log(`[scan] criteria:`, JSON.stringify(criteria));
+    imap.on("error", (err) => {
+      console.error(`[scan] imap error:`, err.message);
+      reject(err);
+    });
 
-    imap.search(criteria, (err, uids) => {
-      if (err) { send("error", { message: err.message }); res.end(); return; }
-      console.log(`[scan] found ${uids ? uids.length : 0} UIDs`);
+    imap.once("ready", () => {
+      send("status", { message: "connected — opening folder…" });
+      imap.openBox(folder || "INBOX", true, (err) => {
+        if (err) { reject(err); return; }
+        send("status", { message: "searching for matching messages…" });
 
-      if (!uids || uids.length === 0) {
-        send("done", { total: 0 });
-        res.end();
-        return;
-      }
+        // Only search on first connect — subsequent reconnects reuse the UID list
+        const doSearch = (cb) => {
+          if (allUids !== null) { cb(null, allUids); return; }
+          imap.search(criteria, (err, uids) => {
+            if (err) { cb(err); return; }
+            console.log(`[scan] found ${uids ? uids.length : 0} UIDs`);
+            allUids   = uids || [];
+            remaining = [...allUids];
+            cb(null, allUids);
+          });
+        };
 
-      send("total", { count: uids.length });
+        doSearch((err, uids) => {
+          if (err) { reject(err); return; }
 
-      const allEmails = [];
-      let   remaining = [...uids];
+          if (uids.length === 0) {
+            send("done", { total: 0 });
+            imap.end();
+            resolve();
+            return;
+          }
 
-      const fetchBatch = () => {
-        const batch = remaining.splice(0, 50);
-        if (batch.length === 0) {
-          const totalSize = allEmails.reduce((s, e) => s + (e.size || 0), 0);
-          console.log(`[scan] complete — ${allEmails.length} emails, ${totalSize} bytes`);
-          send("done", { total: uids.length, totalSize });
-          res.end();
-          return;
-        }
+          // On reconnect, remaining is already trimmed to unsent UIDs
+          if (remaining === null) remaining = [...uids];
+          send("total", { count: uids.length });
 
-        console.log(`[scan] fetching batch of ${batch.length}, ${remaining.length} remaining`);
-        const f = imap.fetch(batch, {
-          bodies: ["HEADER.FIELDS (FROM SUBJECT DATE)"],
-          struct: false,
-          size:   true,
-        });
+          const fetchBatch = () => {
+            if (remaining.length === 0) {
+              const totalSize = allEmails.reduce((s, e) => s + (e.size || 0), 0);
+              console.log(`[scan] complete — ${allEmails.length} emails, ${totalSize} bytes`);
+              send("done", { total: uids.length, totalSize });
+              imap.end();
+              resolve();
+              return;
+            }
 
-        f.on("message", (msg) => {
-          const email = { uid: null, from: "", subject: "", date: "", size: 0, read: false };
-          let headerDone = false, attrDone = false;
+            const batch = remaining.slice(0, 50);
+            console.log(`[scan] fetching batch of ${batch.length}, first=${batch[0]}, last=${batch[batch.length-1]}, ${remaining.length} remaining`);
 
-          const tryEmit = () => {
-            if (headerDone && attrDone) { allEmails.push(email); send("email", email); }
+            // Ensure all UIDs are integers — malformed UIDs cause "Illegal arguments"
+            const cleanBatch = batch.map(u => parseInt(u)).filter(n => !isNaN(n) && n > 0);
+            if (cleanBatch.length === 0) {
+              console.warn(`[scan] batch had no valid UIDs, skipping`);
+              remaining.splice(0, batch.length);
+              fetchBatch();
+              return;
+            }
+
+            let batchDone = false;
+            const f = imap.fetch(cleanBatch, {
+              bodies: ["HEADER.FIELDS (FROM SUBJECT DATE)"],
+              struct: false,
+              size:   true,
+            });
+
+            f.on("message", (msg) => {
+              const email = { uid: null, from: "", subject: "", date: "", size: 0, read: false };
+              let headerDone = false, attrDone = false;
+
+              const tryEmit = () => {
+                if (headerDone && attrDone) {
+                  allEmails.push(email);
+                  // Remove this UID from remaining as we confirm it's fetched
+                  const idx = remaining.indexOf(email.uid);
+                  if (idx !== -1) remaining.splice(idx, 1);
+                  send("email", email);
+                }
+              };
+
+              msg.on("attributes", (attrs) => {
+                email.uid  = attrs.uid;
+                email.size = attrs.size || 0;
+                email.read = !!(attrs.flags && attrs.flags.includes("\\Seen"));
+                attrDone   = true;
+                tryEmit();
+              });
+
+              msg.on("body", (stream) => {
+                let buf = "";
+                stream.on("data", c => { buf += c.toString(); });
+                stream.once("end", () => {
+                  email.from    = (buf.match(/^From:\s*(.+)$/mi)    || [])[1]?.trim().slice(0, 80)  || "(no sender)";
+                  email.subject = (buf.match(/^Subject:\s*(.+)$/mi) || [])[1]?.trim().slice(0, 100) || "(no subject)";
+                  email.date    = (buf.match(/^Date:\s*(.+)$/mi)    || [])[1]?.trim()               || "";
+                  headerDone    = true;
+                  tryEmit();
+                });
+              });
+            });
+
+            f.once("end", () => {
+              // Any UIDs still in the batch that weren't emitted are left in
+              // remaining for the next reconnect to retry
+              batchDone = true;
+              fetchBatch();
+            });
+
+            f.once("error", (e) => {
+              console.error(`[scan] fetch error:`, e.message);
+              if (isTransientError(e)) {
+                reject(e); // triggers reconnect
+              } else {
+                send("error", { message: e.message });
+                res.end();
+              }
+            });
           };
 
-          msg.on("attributes", (attrs) => {
-            email.uid  = attrs.uid;
-            email.size = attrs.size || 0;
-            email.read = !!(attrs.flags && attrs.flags.includes("\\Seen"));
-            attrDone   = true;
-            tryEmit();
-          });
-
-          msg.on("body", (stream) => {
-            let buf = "";
-            stream.on("data", c => { buf += c.toString(); });
-            stream.once("end", () => {
-              email.from    = (buf.match(/^From:\s*(.+)$/mi)    || [])[1]?.trim().slice(0, 80)  || "(no sender)";
-              email.subject = (buf.match(/^Subject:\s*(.+)$/mi) || [])[1]?.trim().slice(0, 100) || "(no subject)";
-              email.date    = (buf.match(/^Date:\s*(.+)$/mi)    || [])[1]?.trim()               || "";
-              headerDone    = true;
-              tryEmit();
-            });
-          });
+          fetchBatch();
         });
-
-        f.once("end",   fetchBatch);
-        f.once("error", (e) => { send("error", { message: e.message }); res.end(); });
-      };
-
-      fetchBatch();
+      });
     });
+
+    imap.connect();
   });
+
+  // Reconnect loop
+  while (true) {
+    try {
+      await runScan();
+      break; // completed cleanly
+    } catch (err) {
+      if (isTransientError(err) && reconnects < MAX_SCAN_RECONNECTS) {
+        reconnects++;
+        const fetched = allEmails.length;
+        const total   = allUids ? allUids.length : "?";
+        const left    = remaining ? remaining.length : "?";
+        console.log(`[scan] reconnect #${reconnects} after error: ${err.message} — ${fetched}/${total} fetched, ${left} remaining`);
+        send("status", { message: `Connection dropped — reconnecting (${fetched.toLocaleString()} fetched so far)…` });
+        await sleep(RECONNECT_WAIT);
+      } else {
+        console.error(`[scan] giving up after ${reconnects} reconnects:`, err.message);
+        send("error", { message: err.message });
+        res.end();
+        break;
+      }
+    }
+  }
 });
 
 // ── POST /api/delete ──────────────────────────────────────────────────────────
@@ -542,6 +646,175 @@ app.post("/api/delete", async (req, res) => {
   console.log(`[delete] complete — ${deleted}/${allUids.length} deleted, ${reconnects} reconnects`);
   send("done", { deleted, total: allUids.length, rateLimitHits });
   end();
+});
+
+const fs   = require("fs");
+const os   = require("os");
+const crypto = require("crypto");
+
+// In-progress and completed archive jobs
+const archiveJobs = new Map(); // jobId -> { status, file, written, total, error, filename }
+
+// ── POST /api/archive/start — begin archiving, stream SSE progress ────────────
+app.post("/api/archive/start", async (req, res) => {
+  const { host, port, tls, user, password, folder, uids: uidsParam } = req.body;
+  const cfg = { host, port, tls: tls === true || tls === "true", user, password };
+
+  const uids = Array.isArray(uidsParam)
+    ? uidsParam.map(Number).filter(Boolean)
+    : (uidsParam ? String(uidsParam).split(",").map(Number).filter(Boolean) : []);
+  if (uids.length === 0) { res.status(400).json({ error: "No UIDs provided" }); return; }
+
+  // Create a temp file to write the mbox into
+  const jobId   = crypto.randomBytes(8).toString("hex");
+  const tmpFile = path.join(os.tmpdir(), `imap-archive-${jobId}.mbox`);
+  const filename = `archive-${new Date().toISOString().slice(0,10)}.mbox`;
+  const job = { status: "running", file: tmpFile, filename, written: 0, total: uids.length, error: null };
+  archiveJobs.set(jobId, job);
+
+  // SSE stream for progress
+  const { send, end } = sseStream(res);
+  send("started", { jobId, total: uids.length });
+
+  console.log(`[archive:${jobId}] ${uids.length} UIDs from ${folder || "INBOX"}, tls=${cfg.tls}`);
+
+  const BATCH          = 5;    // small batches — messages can be very large
+  const BATCH_TIMEOUT  = 600000; // 10 min per batch
+  const MAX_RECONNECTS = 20;
+  let written          = 0;
+  let remaining        = [...uids];
+  let reconnects       = 0;
+  let fileStream       = fs.createWriteStream(tmpFile, { flags: "a" });
+
+  const runArchive = () => new Promise((resolve, reject) => {
+    const imap = makeImap(cfg);
+    imap.on("error", (err) => { reject(err); });
+
+    imap.once("ready", () => {
+      imap.openBox(folder || "INBOX", true, async (err) => {
+        if (err) { reject(err); return; }
+        console.log(`[archive:${jobId}] box open — ${remaining.length} remaining`);
+
+        while (remaining.length > 0) {
+          const batch = remaining.slice(0, BATCH);
+
+          try {
+            await withTimeout(new Promise((res2, rej2) => {
+              const f       = imap.fetch(batch, { bodies: "", struct: false });
+              let   pending = batch.length;
+              const msgs    = new Map();
+
+              f.on("message", (msg, seqno) => {
+                let uid  = null;
+                let body = "";
+                let date = new Date();
+                msg.on("attributes", (attrs) => { uid = attrs.uid; date = attrs.date || new Date(); });
+                msg.on("body", (stream) => { stream.on("data", c => { body += c.toString("binary"); }); });
+                msg.once("end", () => {
+                  msgs.set(uid || seqno, { body, date });
+                  pending--;
+                  if (pending === 0) {
+                    for (const buid of batch) {
+                      const m = msgs.get(buid);
+                      if (!m) continue;
+                      const dateLine = (m.date instanceof Date ? m.date : new Date()).toUTCString();
+                      const envelope = `From MAILER-DAEMON ${dateLine}\r\n`;
+                      const escaped  = m.body.replace(/^From /gm, ">From ");
+                      const sep      = escaped.endsWith("\r\n\r\n") ? "" : "\r\n\r\n";
+                      fileStream.write(Buffer.from(envelope + escaped + sep, "binary"));
+                      written++;
+                      job.written = written;
+                    }
+                    res2();
+                  }
+                });
+              });
+
+              f.once("error", rej2);
+              f.once("end", () => { if (pending > 0) res2(); });
+            }), BATCH_TIMEOUT, `fetch timed out for batch of ${batch.length}`);
+
+            remaining.splice(0, batch.length);
+            const sizeMB = (fs.existsSync(tmpFile) ? fs.statSync(tmpFile).size : 0) / 1024 / 1024;
+            console.log(`[archive:${jobId}] ${written}/${uids.length} written, ${sizeMB.toFixed(1)} MB`);
+            send("progress", { written, total: uids.length, sizeMB: parseFloat(sizeMB.toFixed(1)) });
+
+          } catch (err) {
+            if (isTransientError(err)) {
+              imap.destroy();
+              reject(err);
+              return;
+            }
+            console.error(`[archive:${jobId}] batch error, skipping ${batch.length}:`, err.message);
+            send("warning", { message: `Skipped ${batch.length} messages: ${err.message.slice(0,80)}` });
+            remaining.splice(0, batch.length);
+          }
+        }
+
+        imap.end();
+        resolve();
+      });
+    });
+
+    imap.connect();
+  });
+
+  // Reconnect loop
+  while (remaining.length > 0 && reconnects <= MAX_RECONNECTS) {
+    try {
+      await runArchive();
+      break;
+    } catch (err) {
+      if (isTransientError(err) && reconnects < MAX_RECONNECTS) {
+        reconnects++;
+        const wait = Math.min(10000 * reconnects, 60000);
+        console.log(`[archive:${jobId}] reconnect #${reconnects} in ${wait/1000}s, ${remaining.length} remaining`);
+        send("reconnect", { attempt: reconnects, retryIn: wait, remaining: remaining.length });
+        // Reopen file stream for append after reconnect
+        fileStream = fs.createWriteStream(tmpFile, { flags: "a" });
+        await sleep(wait);
+      } else {
+        console.error(`[archive:${jobId}] giving up:`, err.message);
+        job.error = err.message;
+        break;
+      }
+    }
+  }
+
+  // Finalise
+  await new Promise(r => fileStream.end(r));
+  const finalSize = fs.existsSync(tmpFile) ? fs.statSync(tmpFile).size : 0;
+  job.status = job.error ? "error" : "done";
+
+  console.log(`[archive:${jobId}] complete — ${written}/${uids.length} written, ${(finalSize/1024/1024).toFixed(1)} MB`);
+  send("done", {
+    jobId,
+    written,
+    total: uids.length,
+    sizeMB: parseFloat((finalSize / 1024 / 1024).toFixed(1)),
+    error: job.error,
+  });
+  end();
+});
+
+// ── GET /api/archive/download/:jobId — download the completed mbox file ───────
+app.get("/api/archive/download/:jobId", (req, res) => {
+  const job = archiveJobs.get(req.params.jobId);
+  if (!job)                          { res.status(404).send("Job not found"); return; }
+  if (job.status === "running")      { res.status(409).send("Still in progress"); return; }
+  if (!fs.existsSync(job.file))      { res.status(410).send("File no longer available"); return; }
+
+  res.setHeader("Content-Type",        "application/mbox");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.filename}"`);
+  res.setHeader("Content-Length",      fs.statSync(job.file).size);
+
+  const stream = fs.createReadStream(job.file);
+  stream.pipe(res);
+  stream.on("end", () => {
+    // Clean up temp file after download
+    fs.unlink(job.file, () => {});
+    archiveJobs.delete(req.params.jobId);
+  });
 });
 
 // ── start ─────────────────────────────────────────────────────────────────────
