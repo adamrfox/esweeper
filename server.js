@@ -96,7 +96,10 @@ function parseImapDate(str) {
 // when we hit that we split the date range in half and search each half,
 // recursively, until every sub-range fits under the cap.
 function searchWithBisection(imap, criteria, onProgress) {
-  const RESULT_CAP = 1000;
+  // Yahoo caps IMAP SEARCH results at ~1000 but the actual returned count
+  // can be anything from ~900 to exactly 1000. We use a conservative 900
+  // threshold to catch all cases, then bisect the date range and re-search.
+  const RESULT_CAP = 900;
 
   // Extract the SINCE/BEFORE range from the criteria, if present
   const extractRange = (crit) => {
@@ -116,13 +119,14 @@ function searchWithBisection(imap, criteria, onProgress) {
 
   const search = async (crit) => {
     const uids = await runOne(crit);
+    const { since, before, rest } = extractRange(crit);
+    const rangeStr = since && before ? `${imapDate(since)}..${imapDate(before)}` : "(no range)";
+    console.log(`[search] ${rangeStr} returned ${uids.length} UIDs`);
 
     // If we didn't hit the cap, or we can't bisect further, return as-is
     if (uids.length < RESULT_CAP) return uids;
 
-    const { since, before, rest } = extractRange(crit);
     if (!since || !before) {
-      // No date range to split — return what we got and warn
       console.warn(`[search] hit result cap of ${RESULT_CAP} but no date range to split`);
       return uids;
     }
